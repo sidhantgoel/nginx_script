@@ -6,6 +6,8 @@ NGINX_ROOT='/var/www'
 NGINX_TEMPLATE="`dirname $0`/nginx.template.conf"
 WP_TEMPLATE="`dirname $0`/wp.config.template.php"
 ETC_HOSTS='/etc/hosts'
+PACKAGES="unzip php5-common php5-mysql php5-xmlrpc php5-cgi php5-curl php5-gd php5-cli php5-fpm php-apc php-pear php5-dev php5-imap php5-mcrypt mysql-server mysql-client nginx"
+
 
 function warning()
 {
@@ -33,6 +35,15 @@ function yesno()
     [[ $ans == 'y' || $ans == 'yes' ]]
 }
 
+function installppa()
+{
+    echo "Installing PPA $1."
+    add-apt-repository $1
+    if [[ $? -ne 0 ]]; then
+        error "Error adding PPA."
+    fi
+}
+
 function installpackage()
 {
     local package=$1
@@ -49,23 +60,60 @@ function installpackage()
     fi
 }
 
-function cgi_fixpathinfo()
+function installpackages()
 {
-    sed -i "s/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/g" /etc/php5/fpm/php.ini
+    for package in $1
+    do
+        installpackage $package
+    done 
+}
+
+function upgradephp()
+{
+    PHP_VER=`php5 -r "echo PHP_VERSION_ID;"`
+    if (( PHP_VER < 50400 )); then
+        echo "Upgrading packages."
+        apt-get -y upgrade
+    fi
+    PHP_VER=`php5 -r "echo PHP_VERSION_ID;"`
+    if (( PHP_VER < 50400 )); then
+        error "Unable to upgrade php5."
+    fi
 }
 
 function disableapache()
 {
-    echo "Disabling apache."
-    service apache2 stop > /dev/null 2>&1
-    update-rc.d -f apache2 remove > /dev/null 2>&1
+    echo "Checking for apache2."
+    ps ax | grep /usr/sbin/apache2 | grep -v grep > /dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+        yesno "apache2 running would you like to stop it? (yes/no) : "
+        if [[ $? -eq 0 ]]; then
+            echo "Stoping apache2."
+            service apache2 stop > /dev/null 2>&1
+            if [[ $? -ne 0 ]]; then
+                error "Error stopping apache2."
+            fi
+        fi
+        yesno "do you want to remove apache2 from startup? (yes/no) : "
+        if [[ $? -eq 0 ]]; then
+            echo "Removing apache2 from startup."
+            update-rc.d -f apache2 remove > /dev/null 2>&1
+        fi
+    fi
 }
 
 function startservices()
 {
-    echo "Starting services."
+    echo "(Re)starting nginx service."
     service nginx restart > /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        error "Failed to (re)start nginx service."
+    fi
+    echo "(Re)starting php-fpm service."
     service php5-fpm restart > /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        error "Failed to (re)start php-fpm service."
+    fi
 }
 
 function addhost()
@@ -96,15 +144,33 @@ function createvirtualhost()
     
     #Create config
     cp $NGINX_TEMPLATE $NGINX_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error copying nginx config."
+    fi
     sed -i "s/HOSTNAME/$HOSTNAME/g" $NGINX_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error writting config parameter."
+    fi
     sed -i "s!SITEROOT!$NGINX_ROOT/$HOSTNAME!g" $NGINX_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error writting config parameter."
+    fi
     chmod 600 $NGINX_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error setting file permission."
+    fi
 
     #Setup root
     mkdir $NGINX_ROOT/$HOSTNAME
+    if [[ $? -ne 0 ]]; then
+        error "Error creating siteroot."
+    fi
 
     #Enable site
     ln -s $NGINX_CONFIG $NGINX_ENABLED/$HOSTNAME
+    if [[ $? -ne 0 ]]; then
+        error "Error enabling virtual host."
+    fi
 
     #reload Nginx
     /etc/init.d/nginx reload
@@ -144,15 +210,27 @@ function installwordpress()
     #Download
     wget http://wordpress.org/latest.zip
     if [[ $? -ne 0 ]]; then
-        error "Unable to download wordpress"
+        error "Unable to download wordpress."
     fi
     #Extract
     unzip latest.zip -d ./
+    if [[ $? -ne 0 ]]; then
+        error "Error extracting wordpress zip."
+    fi
     #Copy
     mv -f ./wordpress/* $1
+    if [[ $? -ne 0 ]]; then
+        error "Error copying wordpress files."
+    fi
     #Remove temp
     rm -rf ./wordpress
+    if [[ $? -ne 0 ]]; then
+        error "Error removing temp dir."
+    fi
     rm latest.zip
+    if [[ $? -ne 0 ]]; then
+        error "Error deleting temp file."
+    fi
 }
 
 function wpconfig()
@@ -165,20 +243,46 @@ function wpconfig()
     fi
     echo "Writting config parameters."
     sed -i "s/database_name_here/$2/g" $WP_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error writting config parameter."
+    fi
     sed -i "s/username_here/$3/g" $WP_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error writting config parameter."
+    fi
     sed -i "s/password_here/$4/g" $WP_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error writting config parameter."
+    fi
+    wget https://api.wordpress.org/secret-key/1.1/salt/
+    if [[ $? -ne 0 ]]; then
+        error "Error downloading wordpress salts."
+    fi
+    sed -i -e '\_#SALTS_{
+        r index.html
+        d
+    }' $WP_CONFIG
+    if [[ $? -ne 0 ]]; then
+        error "Error pasting wordpress salts."
+    fi
+    rm index.html
+    if [[ $? -ne 0 ]]; then
+        error "Error deleting temp file, index.html."
+    fi
 }
 
 if [[ $EUID -ne 0 ]]; then
     error "Please run as root"
 fi
 
-PACKAGES="unzip php5 php5-fpm php5-mysql mysql-server mysql-client nginx"
+installpackage "python-software-properties"
 
-for package in $PACKAGES
-do
-    installpackage $package
-done 
+installppa ppa:ondrej/php5
+installppa ppa:nginx/stable
+
+installpackages "$PACKAGES"
+
+upgradephp
 
 read -p 'Enter Domain : ' DOMAIN
 
@@ -190,7 +294,6 @@ installwordpress $NGINX_ROOT/$DOMAIN
 createdatabase "${DOMAIN}_db" "${DOMAIN}_user" "$SQL_PASS"
 wpconfig $NGINX_ROOT/$DOMAIN "${DOMAIN}_db" "${DOMAIN}_user" "$SQL_PASS"
 
-cgi_fixpathinfo
 disableapache
 startservices
 
